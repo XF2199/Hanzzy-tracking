@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<title>Glitch Shape Hand Tracking</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  #stage { position: fixed; inset: 0; }
+  video { display: none; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 16px; z-index: 5; pointer-events: none; gap: 8px;
+  }
+  #topbar * { pointer-events: auto; }
+  #title {
+    color: #fff; font-size: 12px; font-weight: 600;
+    background: rgba(0,0,0,0.35); padding: 6px 12px; border-radius: 20px;
+    backdrop-filter: blur(6px);
+  }
+  .pillbtn {
+    background: rgba(255,255,255,0.12); color: #fff;
+    border: 1px solid rgba(255,255,255,0.25);
+    padding: 8px 14px; border-radius: 20px; font-size: 12px;
+    backdrop-filter: blur(6px);
+  }
+  #startOverlay {
+    position: fixed; inset: 0;
+    background: radial-gradient(circle at 50% 30%, #1a1a2e, #05050a 70%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; z-index: 10; text-align: center; padding: 24px;
+  }
+  #startOverlay h1 {
+    font-size: 20px;
+    background: linear-gradient(90deg, #ff8a00, #ff2d55, #a86bff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #startOverlay p { color: #999; font-size: 13px; max-width: 340px; line-height: 1.6; }
+  #startBtn {
+    background: linear-gradient(90deg, #ff8a00, #ff2d55);
+    border: none; color: #fff; font-weight: 700; font-size: 15px;
+    padding: 14px 32px; border-radius: 30px;
+  }
+  #status {
+    position: fixed; bottom: 16px; left: 16px; right: 16px;
+    color: #ffb86b; font-size: 11px; text-align: center; z-index: 5;
+    background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 10px;
+    backdrop-filter: blur(4px);
+  }
+  #dbg {
+    position: fixed; top: 58px; left: 16px;
+    color: #7dffb0; font-size: 10px; z-index: 5;
+    background: rgba(0,0,0,0.3); padding: 5px 8px; border-radius: 8px;
+    font-family: monospace;
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div id="topbar">
+  <div id="title">🟧 Glitch Shape Tracker</div>
+  <button id="plainBtn" class="pillbtn">🌀 Kotak: Glitch</button>
+  <button id="fsBtn" class="pillbtn">⛶ Fullscreen</button>
+</div>
+
+<div id="dbg">mendeteksi...</div>
+<div id="status">Cari tangan di kamera...</div>
+
+<div id="startOverlay">
+  <h1>Glitch Shape Hand Tracking</h1>
+  <p>
+    Kedua tangan (kiri + kanan) sekaligus, jempol &amp; telunjuk masing-masing →
+    muncul <b>kotak hitam-putih</b> yang melebar/mengecil dan ngikutin gerakan tangan.<br><br>
+    Cuma satu tangan → jempol, telunjuk, jari tengah bentuk <b>segitiga berwarna</b> yang mengecil pas jari ditutup.
+  </p>
+  <button id="startBtn">Mulai Kamera</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const dbgEl = document.getElementById('dbg');
+const startBtn = document.getElementById('startBtn');
+const startOverlay = document.getElementById('startOverlay');
+const fsBtn = document.getElementById('fsBtn');
+const plainBtn = document.getElementById('plainBtn');
+
+let camera = null;
+let handsModel = null;
+let boxPlainMode = false; // false = full glitch box, true = plain B&W (no glitch, just color/shade)
+
+plainBtn.addEventListener('click', () => {
+  boxPlainMode = !boxPlainMode;
+  plainBtn.textContent = boxPlainMode ? '⬛ Kotak: Polos B&W' : '🌀 Kotak: Glitch';
+});
+
+// how long (ms) we keep "believing" a hand is still there after we briefly lose it —
+// this is what fixes the flicker when detection misses a frame or two.
+const GRACE_MS = 450;
+// how fast points glide toward their new position (0 = frozen, 1 = instant snap)
+const SMOOTH = 0.35;
+
+// raw buffered landmark positions per hand (kept even through brief detection dropouts)
+const buf = {
+  Left:  { thumb: null, index: null, middle: null, lastSeen: 0 },
+  Right: { thumb: null, index: null, middle: null, lastSeen: 0 }
+};
+// smoothed (lerped) versions actually used for drawing
+const sm = {
+  Left:  { thumb: null, index: null, middle: null },
+  Right: { thumb: null, index: null, middle: null }
+};
+
+function resizeCanvas() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+fsBtn.addEventListener('click', () => {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => {});
+    fsBtn.textContent = '⛶ Keluar';
+  } else {
+    document.exitFullscreen().catch(() => {});
+    fsBtn.textContent = '⛶ Fullscreen';
+  }
+});
+
+function lerpPt(a, b, t) {
+  if (!a) return { x: b.x, y: b.y };
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+// order 4 loose points into a clean, non-twisted quadrilateral (sort by angle around centroid)
+function orderQuad(pts) {
+  const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+  return [...pts].sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+}
+
+function onResults(results) {
+  const cw = canvas.width, ch = canvas.height;
+  const now = performance.now();
+
+  // draw the camera frame, mirrored, covering the full screen
+  ctx.save();
+  const vw = results.image.width, vh = results.image.height;
+  const scale = Math.max(cw / vw, ch / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+  ctx.translate(cw, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(results.image, cw - dw - dx, dy, dw, dh);
+  ctx.restore();
+
+  const toCanvas = (lm) => ({ x: (1 - lm.x) * cw, y: lm.y * ch });
+
+  let seenLeft = false, seenRight = false;
+
+  if (results.multiHandLandmarks && results.multiHandedness) {
+    results.multiHandLandmarks.forEach((landmarks, i) => {
+      const label = results.multiHandedness[i].label; // reported from unmirrored camera view
+      const userSide = label === 'Left' ? 'Right' : 'Left'; // flip to match what the user sees (selfie)
+      buf[userSide].thumb = toCanvas(landmarks[4]);
+      buf[userSide].index = toCanvas(landmarks[8]);
+      buf[userSide].middle = toCanvas(landmarks[12]);
+      buf[userSide].lastSeen = now;
+      if (userSide === 'Left') seenLeft = true; else seenRight = true;
+    });
+  }
+
+  // a hand still counts as "present" for a short grace window even if this exact frame missed it —
+  // this is what stops the shape from vanishing/flickering when tracking briefly drops.
+  const leftActive = buf.Left.thumb && (now - buf.Left.lastSeen) < GRACE_MS;
+  const rightActive = buf.Right.thumb && (now - buf.Right.lastSeen) < GRACE_MS;
+
+  // smooth toward buffered targets; hard-reset smoothing when a hand has fully timed out
+  ['Left', 'Right'].forEach(side => {
+    const active = side === 'Left' ? leftActive : rightActive;
+    if (active) {
+      sm[side].thumb = lerpPt(sm[side].thumb, buf[side].thumb, SMOOTH);
+      sm[side].index = lerpPt(sm[side].index, buf[side].index, SMOOTH);
+      sm[side].middle = lerpPt(sm[side].middle, buf[side].middle, SMOOTH);
+    } else {
+      sm[side].thumb = null; sm[side].index = null; sm[side].middle = null;
+    }
+  });
+
+  dbgEl.textContent = `Kiri: ${leftActive ? 'terdeteksi' : '-'}  |  Kanan: ${rightActive ? 'terdeteksi' : '-'}`;
+
+  if (leftActive && rightActive) {
+    // BOTH hands -> box from all 4 fingertips (thumb+index of each hand), stretches/shrinks
+    // naturally because the corners ARE the live fingertip positions.
+    const quad = orderQuad([sm.Left.thumb, sm.Left.index, sm.Right.thumb, sm.Right.index]);
+    drawGlitchFill(quad, true, boxPlainMode);
+    drawDot(sm.Left.thumb); drawDot(sm.Left.index);
+    drawDot(sm.Right.thumb); drawDot(sm.Right.index);
+    statusEl.textContent = 'Kotak aktif — tarik tangan buat melebar/mengecil';
+  } else if (leftActive || rightActive) {
+    // ONE hand only -> colorful triangle from thumb/index/middle, shrinks as fingers close
+    const h = leftActive ? sm.Left : sm.Right;
+    drawGlitchFill([h.thumb, h.index, h.middle], false, false);
+    drawDot(h.thumb); drawDot(h.index); drawDot(h.middle);
+    statusEl.textContent = 'Segitiga aktif — kepal jari buat mengecilkan, tunjukin tangan satunya buat kotak';
+  } else {
+    statusEl.textContent = 'Cari tangan di kamera...';
+  }
+}
+
+function drawDot(p) {
+  if (!p) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+// Fills a polygon with a heavy multi-layer glitch effect (many sliced bands, vertical tearing,
+// chromatic aberration, scanlines, noise specks), sampled directly from the already-drawn camera
+// frame. mono=true => black & white (box), mono=false => colorful (triangle).
+// plain=true => skip all glitching, just a flat B&W tint that slowly shifts shade (box-only mode).
+function drawGlitchFill(points, mono, plain) {
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = Math.max(maxX - minX, 4);
+  const h = Math.max(maxY - minY, 4);
+
+  ctx.save();
+  ctx.beginPath();
+  points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+  ctx.closePath();
+  ctx.clip();
+
+  if (plain) {
+    // NO glitch/slicing at all — just desaturate the box area and lay a flat tint on top
+    // that slowly cycles shade, so it reads as "color changing" rather than glitchy.
+    ctx.filter = 'grayscale(1) contrast(1.1)';
+    ctx.drawImage(canvas, minX, minY, w, h, minX, minY, w, h);
+    ctx.filter = 'none';
+
+    const t = performance.now() / 500;
+    const shade = Math.floor(140 + 90 * (0.5 + 0.5 * Math.sin(t)));
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.fillStyle = `rgba(${shade},${shade},${shade},0.55)`;
+    ctx.fillRect(minX, minY, w, h);
+  } else {
+    // grayscale filter here is what makes the BOX specifically black & white when not in plain mode.
+    ctx.filter = mono ? 'grayscale(1) contrast(1.2) brightness(1.05)' : 'none';
+
+    // 1) many horizontal slice bands, re-sampled from the canvas itself, offset sideways
+    const bands = 18;
+    const bandH = h / bands;
+    for (let i = 0; i < bands; i++) {
+      const sy = minY + i * bandH;
+      const big = Math.random() < 0.15; // occasional big "corruption jump"
+      const offset = (Math.random() - 0.5) * w * (big ? 0.45 : 0.2);
+      ctx.drawImage(canvas, minX, sy, w, bandH, minX + offset, sy, w, bandH);
+    }
+
+    // 2) a few vertical tearing bands too, for extra chaos
+    const vbands = 5;
+    const vbandW = w / vbands;
+    for (let i = 0; i < vbands; i++) {
+      if (Math.random() < 0.5) continue;
+      const sx = minX + i * vbandW;
+      const offset = (Math.random() - 0.5) * h * 0.25;
+      ctx.drawImage(canvas, sx, minY, vbandW, h, sx, minY + offset, vbandW, h);
+    }
+    ctx.filter = 'none';
+
+    // 3) noise specks scattered through the shape
+    ctx.globalCompositeOperation = 'screen';
+    for (let i = 0; i < 40; i++) {
+      const nx = minX + Math.random() * w;
+      const ny = minY + Math.random() * h;
+      const ns = Math.random() * 3 + 1;
+      ctx.fillStyle = mono
+        ? `rgba(255,255,255,${Math.random() * 0.5})`
+        : `hsla(${Math.random() * 360},100%,70%,${Math.random() * 0.5})`;
+      ctx.fillRect(nx, ny, ns, ns);
+    }
+
+    // 4) multi-layer chromatic aberration
+    const off = Math.max(3, w * 0.018);
+    const layersColor = [
+      ['rgba(0,220,255,0.3)', -off],
+      ['rgba(255,0,150,0.26)', off],
+      ['rgba(255,255,0,0.14)', off * 2]
+    ];
+    const layersMono = [
+      ['rgba(255,255,255,0.22)', -off],
+      ['rgba(190,190,190,0.18)', off],
+      ['rgba(90,90,90,0.14)', off * 2]
+    ];
+    (mono ? layersMono : layersColor).forEach(([color, o]) => {
+      ctx.fillStyle = color;
+      ctx.fillRect(minX + o, minY, w, h);
+    });
+
+    // 5) scanlines with slight flicker
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.strokeStyle = `rgba(0,0,0,${0.22 + Math.random() * 0.12})`;
+    ctx.lineWidth = 1;
+    for (let y = minY; y < maxY; y += 3) {
+      ctx.beginPath(); ctx.moveTo(minX, y); ctx.lineTo(maxX, y); ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+
+  // crisp outline on top
+  ctx.save();
+  ctx.strokeStyle = mono ? 'rgba(255,255,255,0.95)' : 'rgba(0,220,255,0.95)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+async function startCamera() {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Memuat...';
+  try {
+    handsModel = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    handsModel.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      // slightly lower thresholds = faster/more forgiving detection, fewer dropouts
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    handsModel.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => { await handsModel.send({ image: video }); },
+      width: 640,
+      height: 480
+    });
+
+    await camera.start();
+    startOverlay.style.display = 'none';
+  } catch (err) {
+    statusEl.textContent = 'Gagal akses kamera: ' + err.message;
+    startBtn.disabled = false;
+    startBtn.textContent = 'Coba Lagi';
+  }
+}
+
+startBtn.addEventListener('click', startCamera);
+</script>
+
+</body>
+</html>
+
